@@ -10,14 +10,20 @@ import io
 
 # --- Configuration ---
 # Load the API key from environment variables for security
-try:
-    GOOGLE_API_KEY = os.environ['GOOGLE_API_KEY']
-    # Initialize the client with the new unified SDK
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-except KeyError:
-    print("ERROR: GOOGLE_API_KEY environment variable not set.")
-    print("Please set the variable and run the script again.")
+from dotenv import load_dotenv
+
+# Load environment variables from a .env file
+load_dotenv()
+
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+if not GOOGLE_API_KEY:
+    print("ERROR: GOOGLE_API_KEY environment variable not set in .env.")
+    print("Please set the variable in your .env file and run the script again.")
     exit()
+
+try:
+    # Initialize the client with the new unified SDK 
+    client = genai.Client(api_key=GOOGLE_API_KEY)
 except Exception as e:
     print(f"ERROR: Failed to initialize Google Gen AI client: {e}")
     print("Make sure you have installed: pip install google-genai")
@@ -150,24 +156,31 @@ def get_structured_data_from_gemini(text_content):
     Uses the new unified Google Gen AI SDK.
     """
     prompt = f"""
-    You are an expert data extraction AI specializing in product catalogues for architectural hardware.
+    You are an expert data extraction AI specializing in product catalogues for architectural hardware and e-commerce catalogs.
     Analyze the following text from a single catalogue page and return a valid JSON object.
+    Your task is to identify every individual product *variation* and extract its details into a structured format.
+    A single product line might result in multiple variations if it has different prices for different finishes (e.g., Glossy, Satin, Antique).
+    
     The JSON object should contain a single key "products", which is a list of all products found on the page.
 
     For each product in the list, extract:
-    1.  "product_name": The main name or model of the product (e.g., "ANUBHUTI (BRASS)").
+    1.  "product_name": The main name or model of the product. Include the finish in the name if applicable (e.g., "ANUBHUTI (BRASS)", "Mortice Handle Stainless Steel Finish").
     2.  "skus": A list of all variations (SKUs) for that product.
 
     For each SKU in the "skus" list, extract:
+    - "product_code": The unique code or SKU identifier for this specific variation (e.g., "MH-ANT-275", "ABC123").
     - "sku_description": The full descriptive text for the SKU (e.g., "MH Anubhuti (ANT)- 275mm CY").
-    - "finish": The finish or color (e.g., "ANT", "GLOSSY BLK", "SS").
-    - "price": The price as a string (e.g., "Rs. 4577").
-    - "packaging": The standard packaging information, if available (e.g., "6 Pair").
+    - "finish": The specific product finish or color for this variation (e.g., "ANT", "GLOSSY BLK", "SS", "Satin", "Gold PVD", "Antique"). If no finish is specified, use "Standard".
+    - "price": The price as a numerical value only. Remove any currency symbols (Rs., $, €, etc.), commas, and other non-numeric characters. Extract only the number (e.g., if the text says "Rs. 4,577", extract 4577 as a number).
+    - "packaging": The standard packaging information, if available (e.g., "6 Pair", "12 units", "1 box").
 
-    If a product is presented in a table, extract each row as a separate SKU.
-    If no products are found on the page, return a JSON object with an empty "products" list: {{"products": []}}.
-    Do not include headers, footers, or page numbers in the extraction.
-    Ensure the output is a single, clean JSON object without any markdown formatting.
+    Important extraction rules:
+    - If a product row lists multiple prices under columns like 'Glossy', 'Satin', 'Antique', create a separate SKU object for each one that has a price.
+    - If a product is presented in a table, extract each row as a separate SKU, ensuring each variation with a distinct price or finish gets its own entry.
+    - Ignore page headers, footers, logos, page numbers, and general text that is not associated with a specific product.
+    - Focus on identifying every individual product variation, even if they share the same base product name.
+    - If no products are found on the page, return a JSON object with an empty "products" list: {{"products": []}}.
+    - Ensure the output is a single, clean JSON object without any markdown formatting.
 
     Here is the text from the page:
     ---
@@ -204,6 +217,7 @@ def calculate_distance(bbox1, bbox2):
 def associate_images_with_products(products_data, images_list, text_blocks):
     """
     Associates images to products based on the geometric proximity of their bounding boxes.
+    Uses product_name, sku_description, and product_code for better matching with the new format.
     """
     if not images_list:
         return products_data
@@ -213,13 +227,50 @@ def associate_images_with_products(products_data, images_list, text_blocks):
         if not product_name:
             continue
 
-        # Find the bounding box for the product's title text
+        # Collect all possible text identifiers from the product and its SKUs
+        search_terms = [product_name]
+        
+        # Add SKU information for better matching
+        skus = product.get("skus", [])
+        for sku in skus:
+            sku_description = sku.get("sku_description", "")
+            product_code = sku.get("product_code", "")
+            
+            if sku_description and sku_description not in search_terms:
+                search_terms.append(sku_description)
+            if product_code and product_code != "N/A" and product_code not in search_terms:
+                search_terms.append(product_code)
+
+        # Find the bounding box for the product using multiple matching strategies
         product_bbox = None
         for block in text_blocks:
-            # Use a more flexible check for the product name
-            if product_name.lower() in block["text"].lower():
+            block_text_lower = block["text"].lower()
+            
+            # Try matching with product name first (most reliable)
+            if product_name.lower() in block_text_lower:
                 product_bbox = block["bbox"]
                 break
+            
+            # Try matching with SKU description
+            for term in search_terms[1:]:  # Skip product_name as we already checked it
+                if term.lower() in block_text_lower:
+                    product_bbox = block["bbox"]
+                    break
+            
+            if product_bbox:
+                break
+        
+        # If no exact match found, try partial matching with key words from product name
+        if not product_bbox and product_name:
+            # Extract key words (remove common words, keep product identifiers)
+            words = [w for w in product_name.split() if len(w) > 2 and w.lower() not in ['the', 'and', 'for', 'with']]
+            for block in text_blocks:
+                block_text_lower = block["text"].lower()
+                # Check if multiple key words appear in the block
+                matches = sum(1 for word in words if word.lower() in block_text_lower)
+                if matches >= 2:  # At least 2 key words match
+                    product_bbox = block["bbox"]
+                    break
         
         if not product_bbox:
             continue
@@ -300,5 +351,5 @@ def process_catalogue(pdf_path):
 
 if __name__ == "__main__":
     # Replace with the path to your PDF file
-    PDF_FILE_PATH = "/Users/akshat/Documents/pdf-images/pdfs/Kich Price List 2025 - Ver 02.pdf"
+    PDF_FILE_PATH = "/Users/ronballer/Downloads/Kich Price List 2025 - Ver 02_removed.pdf"
     process_catalogue(PDF_FILE_PATH)
